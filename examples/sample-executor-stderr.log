@@ -1,0 +1,4 @@
+23/11/14 10:02:11 INFO UnsafeExternalSorter: Thread 71 spilling sort data of 1824.0 MiB to disk (3 times so far)
+23/11/14 10:09:40 WARN YarnAllocator: Container killed by YARN for exceeding physical memory limits. 9.1 GB of 8.8 GB physical memory used. Consider boosting spark.executor.memoryOverhead.
+23/11/14 10:09:41 ERROR YarnClusterScheduler: Lost executor 4 on worker-3: Container killed by YARN for exceeding physical memory limits.
+23/11/14 10:09:55 WARN TaskSetManager: Lost task 17.0 in stage 1.0 (TID 497): FetchFailed(BlockManagerId(4, worker-3, 7337), shuffleId=0) org.apache.spark.shuffle.FetchFailedException: Failed to connect to worker-3
