@@ -2,7 +2,7 @@
 """Spark log analyzer: reads Spark event logs and/or driver/executor text logs, measures what went wrong
 (skew, spill, GC, memory kills, shuffle sizing, idle executors, failures) and recommends Spark configs.
 
-Standard library only (Python 3.8+).
+Standard library only (Python 3.9+).
 
 Usage:
   analyze_spark_log.py <event-log | rolling-log dir | driver/executor log | folder> [...]

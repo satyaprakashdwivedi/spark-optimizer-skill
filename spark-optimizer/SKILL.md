@@ -33,7 +33,7 @@ python3 <skill-dir>/scripts/analyze_spark_log.py <logs...> \
     [--node-cores 16 --node-mem-gb 64 --nodes 6] [--target-partition-mb 128] [--json] [--out report.md]
 ```
 
-- `<skill-dir>` is the folder this SKILL.md lives in. The script needs only the Python 3.8+ standard library.
+- `<skill-dir>` is the folder this SKILL.md lives in. The script needs only the Python 3.9+ standard library.
 - Pass the event log and the stderr logs together. They complement each other: the event log gives the metrics,
   and stderr gives the reasons (kills, OOM, fetch failures).
 - Use `--json` when you need the raw numbers (per-stage metrics, current config, findings).
