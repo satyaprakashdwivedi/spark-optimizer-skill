@@ -20,6 +20,16 @@
 | 1 save at sales_job.py:88 | 15.0 min | 200 | 54.7s / 15.0 min | 53.7 GB | 26.8 GB | 22.0% |
 | 0 scan parquet sales | 41.8s | 480 | 29.6s / 40.0s | 0 B | 0 B | 6.0% |
 
+**Executor memory (per executor)**
+
+| | |
+|---|---|
+| Heap (`spark.executor.memory`) | 8.0 GB |
+| Overhead | 819.2 MB (default: max(384MB, 10%)) |
+| Container total | 8.8 GB (819.2 MB outside the heap) |
+| Unified memory = (heap - 300MB) x fraction | 4.6 GB, ~591.9 MB per task (8 cores) |
+| Measured heap peak | 7.2 GB (90.0% of heap) |
+
 **Log signals**
 
 | Signal | Count | Example |
@@ -31,8 +41,8 @@
 
 ## Findings
 
-- **[HIGH] Containers were killed for exceeding their memory limit** (memory-overhead): 3 container-kill / memory-limit signals. Heap is not the problem here: off-heap (netty shuffle buffers, Python workers, native libs) exceeded the container's overhead of 819.2 MB (default 10%).
-  - If kills continue, also lower spark.executor.cores so fewer tasks share one container. (Kept the node-fitted spark.executor.memoryOverhead=3072m, spark.executor.pyspark.memory=4g instead of raising it; if this persists, use fewer cores per executor.)
+- **[HIGH] Containers were killed for exceeding their memory limit** (memory-overhead): 3 container-kill signals ("exceeding memory limits" / exit code 137). The heap was not the problem: off-heap memory (Netty shuffle buffers, Python workers, native libraries) went past the container limit. Before: heap 8.0 GB + overhead 819.2 MB (default) = container ~8.8 GB, only 819.2 MB outside the heap. After: overhead 2.0 GB on top of the same heap (measured heap peak 7.2 GB = 90.0% leaves no room to shrink it).
+  - Do not fix this by raising spark.executor.memory: with the default overhead, +8g heap buys only +0.8g off-heap. If tasks then spill, add shuffle partitions rather than heap. If kills continue, lower spark.executor.cores so fewer tasks share one container. (Kept the node-fitted spark.executor.memoryOverhead=3072m, spark.executor.pyspark.memory=4g instead of raising it; if this persists, use fewer cores per executor.)
 - **[HIGH] Shuffle partitions are too large** (shuffle-partitions): Largest shuffle (stage 1) read 53.7 GB over 200 tasks = 274.9 MB per partition (target ~128 MB). Current spark.sql.shuffle.partitions = 200, ~85 cores.
   - With AQE on, a generous partition count is safe: AQE coalesces small partitions at runtime.
 - **[HIGH] Adaptive Query Execution is off** (aqe): Spark 3.5.1 supports AQE but spark.sql.adaptive.enabled is false.

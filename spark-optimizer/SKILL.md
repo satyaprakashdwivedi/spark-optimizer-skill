@@ -53,22 +53,34 @@ Read the report and sanity-check it. Don't just paste it.
 
    Many symptoms share one cause. For example, one skewed partition causes the spill, the long tail and the
    container kill.
-2. **Code beats config.** Call out problems no config can fix:
+2. **Read the kill message before touching memory.** A heap OOM and a container kill are different problems
+   with different settings to change:
+   - **`OutOfMemoryError: Java heap space`:** a task holds too much in the heap. Start with smaller partitions
+     (more shuffle partitions) or fewer cores per executor. Raise heap only after that.
+   - **"Container killed… exceeding memory limits", exit 137 or OOMKilled:** the heap was fine. Off-heap memory
+     (Netty buffers, Python workers, native libraries) went past the container limit.
+     - Raise `spark.executor.memoryOverhead`, not `spark.executor.memory`. The default overhead is
+       max(384MB, 10% of heap), so +8g of heap buys only +0.8g of off-heap.
+     - When the measured heap peak leaves room, the analyzer moves memory from heap to overhead, so the
+       container doesn't grow. Example: 16g + 1.6g becomes 12g + 4g.
+   - Use the report's **Executor memory** table: the container size, the room outside the heap, and the unified
+     memory per task, i.e. (heap − 300MB) × `spark.memory.fraction`.
+3. **Code beats config.** Call out problems no config can fix:
    - cartesian or nested-loop joins;
    - row-at-a-time Python UDFs;
    - `collect()` or `toPandas()` on big data;
    - skewed `groupBy` keys (they need salting);
    - many tiny input files (they need compaction).
-3. **Check the numbers add up:**
+4. **Check the numbers add up:**
    - per-executor heap + `memoryOverhead` + `pyspark.memory` ≤ the node memory ÷ executors per node;
    - total executor cores ≤ the cluster's cores, minus 1 core per node;
    - `maxExecutors` ≥ `spark.executor.instances`.
-4. **Check the platform's defaults:**
+5. **Check the platform's defaults:**
    - AQE is on by default from Spark 3.2.
    - Databricks manages executor sizing. There, focus on SQL and AQE settings, and on instance types.
    - On K8s, overhead is `spark.kubernetes.memoryOverheadFactor` (0.1 by default; 0.4 for non-JVM jobs).
    - On EMR, `maximizeResourceAllocation` may already set executor size.
-5. **Spark version:**
+6. **Spark version:**
    - On Spark 2.x, drop the AQE settings and use `spark.sql.shuffle.partitions` sizing only.
    - Spark 3.0–3.1 needs AQE switched on explicitly.
 

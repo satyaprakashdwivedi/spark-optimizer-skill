@@ -51,6 +51,22 @@ Give Claude your Spark event log and/or your driver and executor logs, and ask i
    config, adjusts for your platform (YARN, Kubernetes, EMR, Databricks) and Spark version, and tells you how to verify the
    improvement on the next run.
 
+### Heap OOM vs container kill
+The analyzer reads the kill message before it touches memory:
+- **`OutOfMemoryError: Java heap space`** is a heap problem. Fix partitions and skew first, then raise heap.
+- **"Container killed… exceeding memory limits" or exit 137** is an off-heap problem. Raise
+  `memoryOverhead`, not `executor.memory`: the default overhead is only max(384MB, 10%).
+
+When the measured heap peak leaves room, it moves memory from heap to overhead so the container doesn't grow:
+
+| | Heap | Overhead | Container | Outside heap |
+|---|---|---|---|---|
+| Before | 16g | 1.6g (default) | ~17.6g | 1.6g |
+| After (heap peaked at 9.5g) | 12g | 4g | 16g | 4g, which is 2.5× |
+
+Every report has an **Executor memory** table showing heap, overhead, container size and unified memory per task:
+(heap − 300MB) × `spark.memory.fraction`.
+
 ### Example
 From a synthetic job ([`examples/`](examples)) with a skewed sort-merge join, 54 GB of shuffle over 200 partitions, AQE off,
 a Python UDF and a YARN memory kill:

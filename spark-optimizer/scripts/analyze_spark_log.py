@@ -429,16 +429,38 @@ class Advisor:
         aqe_default = ver >= (3, 2)
         self.aqe_on = truthy(self.get("spark.sql.adaptive.enabled", str(aqe_default).lower())) and self.aqe_supported
         self.exec_cores = int(self.get("spark.executor.cores") or self.s.get("executor_cores") or 1)
+        self.mem_known = "spark.executor.memory" in self.p
         self.exec_mem = parse_size(self.get("spark.executor.memory", "1g"))
+        kill_text = (self.h.get("container_killed") or {}).get("example", "")
+        self.k8s = str(self.get("spark.master", "")).startswith("k8s") or bool(re.search(r"OOMKilled|ExecutorPods|kubernetes", kill_text, re.I))
         ov = self.get("spark.executor.memoryOverhead") or self.get("spark.yarn.executor.memoryOverhead")
-        self.overhead = parse_size(ov) if ov else max(384 * MB, int(0.10 * self.exec_mem))
+        factor = self.get("spark.executor.memoryOverheadFactor") or (self.get("spark.kubernetes.memoryOverheadFactor") if self.k8s else None)
+        self.overhead_factor = float(factor) if factor else 0.10
+        self.overhead = parse_size(ov) if ov else max(384 * MB, int(self.overhead_factor * self.exec_mem))
         self.overhead_explicit = bool(ov)
+        self.pyspark_mem = parse_size(self.get("spark.executor.pyspark.memory")) if self.get("spark.executor.pyspark.memory") else 0
+        self.offheap = parse_size(self.get("spark.memory.offHeap.size", "0")) if truthy(self.get("spark.memory.offHeap.enabled", "false")) else 0
+        self.container = self.exec_mem + self.overhead + self.pyspark_mem + self.offheap
+        self.mem_fraction = float(self.get("spark.memory.fraction", 0.6))
         self.driver_mem = parse_size(self.get("spark.driver.memory", "1g"))
         self.shuffle_partitions = int(self.get("spark.sql.shuffle.partitions", 200))
         self.total_cores = self.s.get("peak_cores") or (self.exec_cores * int(self.get("spark.executor.instances", 2)))
         self.dyn = truthy(self.get("spark.dynamicAllocation.enabled", "false"))
         self.python = self.s.get("python") or "python_worker" in self.h
         self.planned_cores = None
+
+    def memory_model(self):
+        """What one executor really gets: container = heap + overhead (+ pyspark + offHeap);
+        unified (execution + storage) memory = (heap - 300MB) x spark.memory.fraction, shared by the tasks."""
+        if not self.mem_known:
+            return None
+        unified = max(0, self.exec_mem - 300 * MB) * self.mem_fraction
+        peak = self.s.get("peak_jvm_heap") or 0
+        return {"heap": self.exec_mem, "overhead": self.overhead, "overhead_is_default": not self.overhead_explicit,
+                "pyspark_memory": self.pyspark_mem, "offheap": self.offheap, "container": self.container,
+                "outside_heap": self.container - self.exec_mem, "unified": int(unified),
+                "unified_per_task": int(unified / max(1, self.exec_cores)), "cores": self.exec_cores,
+                "peak_heap": peak or None, "peak_heap_pct": round(pct(peak, self.exec_mem), 1) if peak else None}
 
     # ---- rules
     def run(self):
@@ -456,25 +478,25 @@ class Advisor:
         killed = h.get("container_killed", {}).get("count", 0) + s.get("executors_removed", {}).get("memory/killed", 0)
         oom = sum(h.get(k, {}).get("count", 0) for k in ("oom_heap", "oom_gc"))
         if killed:
-            frac = 0.20 if self.python else 0.15
-            new_ov = max(self.overhead * 2, int(frac * self.exec_mem), 1 * GB)
-            cfg = {"spark.executor.memoryOverhead": round_gb(new_ov)}
-            if self.python:
-                cfg["spark.executor.pyspark.memory"] = round_gb(max(1 * GB, self.exec_mem // 4))
-            self.add("memory-overhead", "high", "Containers were killed for exceeding their memory limit",
-                     f"{killed} container-kill / memory-limit signals. Heap is not the problem here: off-heap "
-                     f"(netty shuffle buffers, Python workers, native libs) exceeded the container's overhead"
-                     + (f" of {fmt_size(self.overhead)}{' (default 10%)' if not self.overhead_explicit else ''}."
-                        if self.p else " (current value unknown: no event log given, sized from defaults)."),
-                     cfg, "If kills continue, also lower spark.executor.cores so fewer tasks share one container.")
+            self.container_kill_rule(killed, oom)
         if oom or h.get("oom_direct"):
-            cfg = {"spark.executor.memory": round_gb(int(self.exec_mem * 1.5))}
-            if h.get("oom_direct"):
-                cfg["spark.executor.memoryOverhead"] = round_gb(max(self.overhead * 2, 1 * GB))
-            self.add("executor-oom", "high", "Executors ran out of memory (OutOfMemoryError)",
-                     f"{oom} heap/GC OOM lines, {h.get('oom_direct', {}).get('count', 0)} direct-memory OOM lines.",
-                     cfg, "Usually caused by skewed partitions, huge partitions or wide rows: fix partition sizing/skew "
-                          "first; more memory is the fallback.")
+            mm = self.memory_model()
+            cfg, extra = {}, ""
+            if self.mem_known:
+                cfg["spark.executor.memory"] = round_gb(int(self.exec_mem * 1.5))
+                if h.get("oom_direct"):
+                    cfg["spark.executor.memoryOverhead"] = round_gb(max(self.overhead * 2, 1 * GB))
+                extra = (f" Each task gets ~{fmt_size(mm['unified_per_task'])} of unified memory "
+                         f"((heap - 300MB) x {self.mem_fraction} / {self.exec_cores} cores).")
+            else:
+                extra = (" Current spark.executor.memory is unknown (no event log or config given), so no absolute "
+                         "value is recommended: raise it ~1.5x from what you run today, or share the event log.")
+            self.add("executor-oom", "high", "Executors ran out of heap (OutOfMemoryError)",
+                     f"{oom} heap/GC OOM lines, {h.get('oom_direct', {}).get('count', 0)} direct-memory OOM lines. "
+                     f"This is a heap problem, unlike container kills (exit 137), which are off-heap." + extra,
+                     cfg, "A task holds too much in the heap: usually one huge or skewed partition, wide rows or a big "
+                          "collect/broadcast. More spark.sql.shuffle.partitions (smaller partitions) or fewer cores per "
+                          "executor often fixes it without more heap; raise heap only after that.")
 
         # 3. shuffle partition sizing
         big = max(stages, key=lambda st: st["shuffle_read"], default=None)
@@ -640,6 +662,58 @@ class Advisor:
                      "Retries hide problems and cost time; fix the root cause above (memory kills, skew, disk).")
         return self
 
+    def container_kill_rule(self, killed, oom):
+        """Off-heap kill. Overhead defaults to max(384MB, 10% of heap), so bumping heap buys off-heap room only by
+        accident. Raise overhead; if the measured heap peak leaves room, take it out of the heap so the container
+        does not grow."""
+        what = (f"{killed} container-kill signals (\"exceeding memory limits\" / exit code 137"
+                f"{' / OOMKilled' if self.k8s else ''}). The heap was not the problem: off-heap memory "
+                f"(Netty shuffle buffers, Python workers, native libraries) went past the container limit.")
+        k8s_note = (" On Kubernetes an explicit spark.executor.memoryOverhead overrides "
+                    "spark.kubernetes.memoryOverheadFactor / spark.executor.memoryOverheadFactor."
+                    if self.k8s else "")
+        if not self.mem_known:
+            self.add("memory-overhead", "high", "Containers were killed for exceeding their memory limit",
+                     what + " Current memory settings are unknown (no event log or config given).", None,
+                     "Set spark.executor.memoryOverhead explicitly to ~15-25% of spark.executor.memory (e.g. 16g heap -> "
+                     "3-4g) instead of raising spark.executor.memory: the default overhead is only max(384MB, 10%), so "
+                     "+8g heap buys just +0.8g off-heap. Share the event log to size it exactly." + k8s_note)
+            return
+        frac = 0.20 if self.python else 0.15
+        new_ov = parse_size(round_gb(max(self.overhead * 2, int(frac * self.exec_mem), 1 * GB)))
+        cfg = {"spark.executor.memoryOverhead": round_gb(new_ov)}
+        if self.python and not self.pyspark_mem:
+            cfg["spark.executor.pyspark.memory"] = round_gb(max(1 * GB, self.exec_mem // 4))
+        new_py = parse_size(cfg.get("spark.executor.pyspark.memory")) if cfg.get("spark.executor.pyspark.memory") else self.pyspark_mem
+        mm = self.memory_model()
+        before = (f"Before: heap {fmt_size(self.exec_mem)} + overhead {fmt_size(self.overhead)}"
+                  f"{' (default)' if not self.overhead_explicit else ''} = container ~{fmt_size(self.container)}, "
+                  f"only {fmt_size(self.container - self.exec_mem)} outside the heap.")
+        peak = self.s.get("peak_jvm_heap") or 0
+        shift = False
+        if peak and not oom and self.s.get("gc_pct", 0) < 10:
+            target_heap = max(GB, math.ceil(peak * 1.25 / GB) * GB)  # measured peak + 25% headroom
+            if target_heap < self.exec_mem and target_heap + new_ov + new_py + self.offheap <= self.container:
+                shift = True
+                cfg["spark.executor.memory"] = f"{target_heap // GB}g"
+                new_container = target_heap + new_ov + new_py + self.offheap
+                unified_task = max(0, target_heap - 300 * MB) * self.mem_fraction / max(1, self.exec_cores)
+                after = (f" After: heap {fmt_size(target_heap)} + overhead {fmt_size(new_ov)} = container "
+                         f"{fmt_size(new_container)}, {fmt_size(new_container - target_heap)} outside the heap "
+                         f"({(new_container - target_heap) / max(1, self.container - self.exec_mem):.1f}x the off-heap room, "
+                         f"{'smaller' if new_container < self.container else 'same-size'} container). Measured heap "
+                         f"peak was {fmt_size(peak)} ({mm['peak_heap_pct']}% of heap), so the heap can shrink. Tasks "
+                         f"still get ~{fmt_size(unified_task)} unified memory each.")
+        if not shift:
+            after = (f" After: overhead {fmt_size(new_ov)} on top of the same heap"
+                     + (f" (measured heap peak {fmt_size(peak)} = {mm['peak_heap_pct']}% leaves no room to shrink it)."
+                        if peak else " (no heap-usage metrics in the logs, so the heap is left alone)."))
+        self.add("memory-overhead", "high", "Containers were killed for exceeding their memory limit",
+                 what + " " + before + after, cfg,
+                 "Do not fix this by raising spark.executor.memory: with the default overhead, +8g heap buys only "
+                 "+0.8g off-heap. If tasks then spill, add shuffle partitions rather than heap. If kills continue, "
+                 "lower spark.executor.cores so fewer tasks share one container." + k8s_note)
+
     def size_executors(self):
         a = self.a
         if a.node_cores and a.node_mem_gb:
@@ -699,7 +773,7 @@ class Advisor:
 SEV_ORDER = {"high": 0, "medium": 1, "low": 2}
 
 
-def report_md(summary, findings, recs, text_hits, inputs):
+def report_md(summary, findings, recs, text_hits, inputs, mm=None):
     s = summary or {}
     out = ["# Spark optimisation report", ""]
     if s:
@@ -724,6 +798,16 @@ def report_md(summary, findings, recs, text_hits, inputs):
                            f"{fmt_ms(st['task_ms_median'])} / {fmt_ms(st['task_ms_max'])} | {fmt_size(st['shuffle_read'])} | "
                            f"{fmt_size(st['disk_spill'])} | {st['gc_pct']}% |")
             out.append("")
+    if mm:
+        peak = f"{fmt_size(mm['peak_heap'])} ({mm['peak_heap_pct']}% of heap)" if mm["peak_heap"] else "n/a"
+        default_note = " (default: max(384MB, 10%))" if mm["overhead_is_default"] else ""
+        out += ["**Executor memory (per executor)**", "", "| | |", "|---|---|",
+                f"| Heap (`spark.executor.memory`) | {fmt_size(mm['heap'])} |",
+                f"| Overhead | {fmt_size(mm['overhead'])}{default_note} |",
+                f"| Container total | {fmt_size(mm['container'])} ({fmt_size(mm['outside_heap'])} outside the heap) |",
+                f"| Unified memory = (heap - 300MB) x fraction | {fmt_size(mm['unified'])}, ~{fmt_size(mm['unified_per_task'])} "
+                f"per task ({mm['cores']} cores) |",
+                f"| Measured heap peak | {peak} |", ""]
     if text_hits:
         out += ["**Log signals**", "", "| Signal | Count | Example |", "|---|---|---|"]
         for k, v in sorted(text_hits.items(), key=lambda kv: -kv[1]["count"]):
@@ -776,13 +860,13 @@ def main(argv=None):
                       text_hits, a).run()
         recs = adv.recommended()
         results.append({"inputs": files + texts, "summary": summary, "findings": adv.findings,
-                        "recommended": recs, "log_signals": text_hits,
+                        "recommended": recs, "log_signals": text_hits, "memory_model": adv.memory_model(),
                         "current_config": {k: v for k, v in props.items() if k.startswith("spark.") and
                                            not re.search(r"password|secret|token|key", k, re.I)}})
     if a.json:
         out = json.dumps(results if len(results) > 1 else results[0], indent=2, default=str)
     else:
-        out = "\n\n---\n\n".join(report_md(r["summary"], r["findings"], r["recommended"], r["log_signals"], r["inputs"])
+        out = "\n\n---\n\n".join(report_md(r["summary"], r["findings"], r["recommended"], r["log_signals"], r["inputs"], r["memory_model"])
                                  for r in results)
     if a.out:
         with open(a.out, "w") as f:

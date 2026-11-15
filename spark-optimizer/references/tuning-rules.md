@@ -17,22 +17,48 @@ workload.
   5. Instances: executors per node × nodes − 1 (one slot is left for the driver or YARN AM).
 - **With node info:** the analyzer locks these values, so other rules can't push the container past the node.
 
-## Memory overhead / container kills
-- **Trigger:** "Container killed by YARN for exceeding memory limits", exit code 137, OOMKilled, or executors
-  removed for memory.
-- **Why:** the container limit is heap + overhead (+ pyspark memory). Kills come from off-heap use, not heap:
-  - netty shuffle buffers;
-  - Python workers;
-  - Arrow;
-  - native libraries.
-- **Fix:**
-  - Raise `spark.executor.memoryOverhead` to at least 15% of heap, and at least 1 GB.
-  - Set `spark.executor.pyspark.memory` for PySpark.
-  - If kills persist, use fewer cores per executor.
+## Heap OOM vs container kill: read the kill message first
+Two failures that look alike and need different settings.
 
-## OutOfMemoryError (heap)
-- **Why:** usually one huge partition (skew, too few partitions), wide rows, or large broadcast/collect.
-- **Fix:** partition sizing and skew first. Then raise `spark.executor.memory` by about 1.5×.
+| Message | What ran out | Setting to change |
+|---|---|---|
+| `java.lang.OutOfMemoryError: Java heap space` / `GC overhead limit exceeded` | JVM heap: a task holds too much | partitions (more), cores per executor (fewer), then `spark.executor.memory` |
+| "Container killed… exceeding memory limits", exit code 137, `OOMKilled` | off-heap: Netty shuffle buffers, Python workers, Arrow, native libraries | `spark.executor.memoryOverhead` (+ `spark.executor.pyspark.memory`) |
+
+**The memory model of one executor:**
+- container = heap + overhead (+ `pyspark.memory` + `offHeap.size`);
+- default overhead = max(384MB, `memoryOverheadFactor` × heap), where the factor is 0.10;
+- unified memory (execution + storage) = (heap − 300MB) × `spark.memory.fraction` (default 0.6), shared by the
+  executor's concurrent tasks.
+
+**Why "just bump executor memory" is wrong for kills:** with the default factor, +8g of heap buys only +0.8g of
+off-heap room. You pay for 8g you didn't need to get 0.8g you did.
+
+**Container-kill rule:**
+1. New overhead = max(2 × current, 15% of heap (20% for PySpark), 1 GB), rounded to a clean value.
+2. If the event log has a measured heap peak, there's no heap OOM and GC is under 10%, shrink the heap to
+   peak × 1.25 (rounded up to a whole GB), as long as heap + new overhead fits inside the current container.
+3. Otherwise keep the heap and add the overhead on top. The container grows; if kills persist, lower
+   `spark.executor.cores`.
+
+Worked example (5 cores):
+
+| | Heap | Overhead | Container | Outside heap | Unified per task |
+|---|---|---|---|---|---|
+| Before | 16g | 1.6g (default) | ~17.6g | 1.6g | ~1.9g |
+| After (heap peak 9.5g) | 12g | 4g | 16g | 4g (2.5×) | ~1.4g |
+
+If tasks then spill, add shuffle partitions rather than heap.
+
+**Kubernetes:** an explicit `spark.executor.memoryOverhead` overrides `spark.kubernetes.memoryOverheadFactor` and
+`spark.executor.memoryOverheadFactor`. The pod is killed with OOMKilled / exit 137.
+
+**Heap OOM rule:**
+- Usually one huge partition (skew, too few partitions), wide rows, or a large broadcast or collect.
+- Fix partition sizing and skew first, then raise `spark.executor.memory` by about 1.5×.
+- The heap is never shrunk when a heap OOM is present.
+- With text logs only (current memory unknown), the analyzer gives relative advice instead of inventing an absolute
+  value.
 
 ## Shuffle partitions
 - **Target:** about 128 MB of shuffle data per partition (`--target-partition-mb`).
